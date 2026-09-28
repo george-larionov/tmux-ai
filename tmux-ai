@@ -9,7 +9,7 @@
 set -uo pipefail
 
 PANE="${1:-$(tmux display -p '#{pane_id}')}"
-MODEL="${TMUX_AI_MODEL:-claude-haiku-4-5-20251001}"
+MODEL="${TMUX_AI_MODEL:-claude-haiku-4-5}"
 HIST_N="${TMUX_AI_HISTORY:-10}"
 
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-ai"

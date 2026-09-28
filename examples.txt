@@ -1,0 +1,51 @@
+# Worked examples for tmux-ai, sent to the model with every request.
+#
+# Format: blocks separated by blank lines. The first line of a block is the
+# request; the remaining lines are the ideal answer (tmux commands, or "# "
+# lines for a clarifying question). A block whose first line starts with "#"
+# is a comment, like this one.
+#
+# Ids are illustrative: current pane %1 in window @1 (index 1) of session "work".
+# Add your own in ~/.config/tmux-ai/examples.txt (same format; those win on conflicts).
+
+put pane 3 next to pane 2
+join-pane -h -s %3 -t %2
+
+put pane 3 under pane 2
+join-pane -v -s %3 -t %2
+
+combine panes 2 and 3 vertically
+# Side by side (vertical divider) or stacked top/bottom?
+
+move this pane to its own window
+break-pane -s %1
+
+move pane 2 into window 3
+join-pane -s %2 -t work:3
+
+bring window 2 here, below this pane
+join-pane -v -s work:2 -t %1
+
+swap panes 1 and 2
+swap-pane -s %1 -t %2
+
+even them out side by side
+select-layout -t @1 even-horizontal
+
+make this pane 40% wide
+resize-pane -t %1 -x 40%
+
+zoom pane 2
+resize-pane -Z -t %2
+
+rename this window to logs
+rename-window -t @1 logs
+
+move window 4 to slot 1 (slot 1 is taken)
+swap-window -s work:4 -t work:1
+
+renumber windows
+move-window -r -t work:
+
+split this pane side by side and open htop on the right
+split-window -h -t %1 htop

@@ -8,7 +8,7 @@ tmux> combine panes 2 and 3
 reply> side by side
 join-pane -h -s %3 -t %2
 
-Run? [Y/n/e(dit)/r(eply)]
+Run? [y/n/e(dit)/r(eply)]
 ```
 
 Unlike AI terminal assistants that run shell commands, tmux-ai manages **tmux itself**: panes, windows, layouts and sessions. Nothing runs until you confirm.
@@ -57,13 +57,15 @@ Press `prefix` + `a`, type a request, and press Enter.
 | Key | Where | Action |
 |---|---|---|
 | ↑ / ↓ | prompt | Recall past requests |
-| Enter / `y` | Run? | Run the commands |
+| `y` | Run? | Run the commands (other keys are ignored) |
 | `n` | Run? | Cancel |
 | `e` | Run? | Edit the commands in `$EDITOR`, then run |
 | `r` | Run? | Reply with a correction ("no, the other way") |
-| Esc | anywhere | Close the popup (also cancels a pending request) |
+| Ctrl-C | anywhere | Close the popup (also cancels a pending request). Esc works too on bash 4.3+. |
 
-If Claude needs clarification, it asks a question and you answer at the `reply>` prompt. Each turn sends the whole conversation along with the current layout of every session, window and pane.
+If Claude needs clarification, it asks a question and you answer at the `reply>` prompt. Each turn sends the whole conversation along with the current layout of every session, window and pane. It also sends your tmux version's own command reference (`tmux list-commands`), so the syntax matches what you have installed.
+
+Before you see a proposal, tmux parses it without running anything (`source-file -n`), and Claude quietly fixes syntax errors. Commands then run one at a time and stop at the first failure. That error goes back to Claude with the updated layout so it can propose a fix.
 
 The last few exchanges are also included, so follow-ups like "undo that" or "do the same in window 2" work across popups.
 
@@ -75,6 +77,25 @@ Set these environment variables in the shell that starts tmux, or with `set-envi
 |---|---|---|
 | `TMUX_AI_MODEL` | `claude-haiku-4-5-20251001` | Model to use. Try `claude-sonnet-5` for trickier requests. |
 | `TMUX_AI_HISTORY` | `10` | Past exchanges sent as context (`0` to disable) |
+
+## Examples
+
+Claude learns the expected style from worked examples sent with every request:
+
+- `examples.txt` in this repo ships the defaults. Improving tmux-ai is usually just adding a block here.
+- `~/.config/tmux-ai/examples.txt` holds your own conventions, which override the defaults.
+
+Blocks are separated by blank lines. The first line is the request, and the rest is the ideal answer: tmux commands, or `# ` lines for a clarifying question. Ids are illustrative. For example:
+
+```
+make a vertical split
+split-window -h -t %1
+
+send this pane to the logs window
+join-pane -s %1 -t work:logs
+```
+
+When tmux-ai gets something wrong, look up the case in `~/.local/state/tmux-ai/log.jsonl` and add the corrected version as an example.
 
 ## Files
 
@@ -88,7 +109,8 @@ Both files are trimmed automatically. Delete them anytime to start fresh. `$XDG_
 ## Troubleshooting
 
 - **The popup flashes and closes:** run `~/src/tmux-ai/tmux-ai` directly inside tmux to see the error. It's usually a missing `jq` or API key.
-- **Esc needs two presses:** you're on bash 3.2. Install a newer bash.
+- **Esc doesn't close the popup:** use Ctrl-C. Esc needs bash 4.3+ (`brew install bash` on macOS).
+- **Too many wrong commands:** set `TMUX_AI_MODEL=claude-sonnet-5`.
 
 ## License
 

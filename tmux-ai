@@ -19,7 +19,7 @@ mkdir -p "$STATE"
 
 # ---------- UI ----------
 ROWS=$(tput lines); COLS=$(tput cols)
-HINT="Press Esc to close"
+HINT="Ctrl-C to close"
 ESC=$'\e'
 # Fractional read timeouts need bash 4+ (macOS ships 3.2 — `brew install bash` recommended).
 if (( BASH_VERSINFO[0] >= 4 )); then POLL=0.1; else POLL=1; fi
@@ -51,9 +51,10 @@ ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$(cat ~/.config/anthropic/api_key 2>/dev
 [[ -n $ANTHROPIC_API_KEY ]] || pause "No API key: set ANTHROPIC_API_KEY or create ~/.config/anthropic/api_key" 1
 command -v jq >/dev/null || pause "jq not found — install it (brew/apt install jq)" 1
 
-# ---------- Prompt (readline, with history and Esc) ----------
+# ---------- Prompt (readline, with history) ----------
+# Ctrl-C always closes. Esc also closes where readline allows it (bash 4.3+; any editing mode).
 bind 'set keyseq-timeout 50' 2>/dev/null
-bind -x '"\e": exit 0' 2>/dev/null   # bare Esc quits; arrow keys still work
+for km in emacs vi-insert vi-command; do bind -m "$km" -x '"\e": exit 0' 2>/dev/null; done
 HISTFILE="$HIST_FILE"
 history -r "$HIST_FILE" 2>/dev/null
 
@@ -75,37 +76,69 @@ fi
 
 layout() {  # the live tmux state, re-read whenever it may have changed
   cat <<EOF
-Current: $(tmux display -p -t "$PANE" 'session=#{session_name} window=#{window_index} (#{window_name}) pane_index=#{pane_index} pane_id=#{pane_id} window_size=#{window_width}x#{window_height}')
+Current: $(tmux display -p -t "$PANE" 'session=#{session_name} window=#{window_index} window_id=#{window_id} (#{window_name}) pane_index=#{pane_index} pane_id=#{pane_id} window_size=#{window_width}x#{window_height}')
 
 Sessions:
 $(tmux list-sessions -F '#{session_name} windows=#{session_windows} attached=#{session_attached}')
 
 Windows:
-$(tmux list-windows -a -F '#{session_name}:#{window_index} name=#{window_name} active=#{window_active} layout=#{window_layout}')
+$(tmux list-windows -a -F '#{session_name}:#{window_index} id=#{window_id} name=#{window_name} panes=#{window_panes} active=#{window_active} layout=#{window_layout}')
 
 Panes:
-$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} id=#{pane_id} size=#{pane_width}x#{pane_height} at=#{pane_left},#{pane_top} cmd=#{pane_current_command} path=#{pane_current_path} active=#{pane_active}')
+$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} id=#{pane_id} window=#{window_id} size=#{pane_width}x#{pane_height} at=#{pane_left},#{pane_top} cmd=#{pane_current_command} path=#{pane_current_path} active=#{pane_active} zoomed=#{window_zoomed_flag}')
 EOF
 }
 
-CTX="$(layout)
+CTX="tmux $(tmux -V | cut -d' ' -f2), base-index=$(tmux show -gv base-index 2>/dev/null), pane-base-index=$(tmux show -gwv pane-base-index 2>/dev/null)
+
+$(layout)
 
 Recent history (oldest first; the tmux state may have changed since):
 ${PAST:-(none)}"
 
-SYS='You translate natural-language requests into tmux commands, in a short conversation with the user.
-When you have enough to act: output ONLY tmux commands in tmux config-file syntax (no leading "tmux", no markdown, no commentary), one per line.
-Always use explicit targets (-t/-s) from the context, since ids stay stable while indices shift.
-Match the target TYPE each flag expects, or tmux fails with "cannot specify pane here":
-- pane targets (%N or session:window.pane): join-pane -s/-t, move-pane -s/-t, swap-pane -s/-t, break-pane -s, resize-pane -t, kill-pane -t, select-pane -t, split-window -t
-- window targets (@N or session:window, NEVER a pane): break-pane -t (destination window; to make a new window use "session:" or omit -t), move-window -s/-t, swap-window -s/-t, select-layout -t, rename-window -t, kill-window -t, select-window -t
-- session targets (session name): new-window -t, rename-session -t, switch-client -t
-Pane/window numbers the user mentions mean pane_index/window_index in the CURRENT window/session unless stated otherwise.
-Use the recent history to resolve references like "undo that", "do it again" or "the other one"; the current layout above is authoritative.
-Prefer the fewest commands. Useful: join-pane, break-pane, swap-pane, move-window, select-layout, resize-pane, split-window, rename-window, kill-pane.
-If the request is ambiguous, ask ONE short clarifying question (offer the likely options) on lines starting with "# ", and output no commands. The user will reply.
-If it is impossible, explain briefly on lines starting with "# ".
-Later user messages are replies, corrections, or tmux errors from running your commands (with the updated layout); answer each with a complete, fresh set of commands for what still needs doing (or another "# " question).'
+# ---------- Examples (static, so the system prompt stays cacheable) ----------
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+load_examples() {  # blank-line-separated blocks: request line, then the ideal answer; blocks starting with "#" are comments
+  [[ -r $1 ]] || return 0
+  awk 'BEGIN { RS = "" } $0 !~ /^#/ {
+    n = split($0, L, "\n"); out = "- \"" L[1] "\" ->"
+    for (i = 2; i <= n; i++) out = out "\n    " L[i]
+    print out
+  }' "$1"
+}
+USER_EX=$(load_examples "${XDG_CONFIG_HOME:-$HOME/.config}/tmux-ai/examples.txt")
+
+SYS="You translate natural-language requests into tmux commands, in a short conversation with the user.
+
+OUTPUT
+- When you have enough to act: output ONLY tmux commands in tmux config-file syntax (no leading \"tmux\", no markdown, no commentary), one per line. They run in order; execution stops at the first failure.
+- If the request is ambiguous, ask ONE short clarifying question (offer the likely options) on lines starting with \"# \", and output no commands. The user will reply.
+- If it is impossible, explain briefly on lines starting with \"# \".
+- Later user messages are replies, corrections, or tmux errors (with the updated layout). Answer each with a complete, fresh set of commands for what still needs doing, or another \"# \" question.
+
+TARGETS
+- Always pass explicit targets using ids from the context: panes %N, windows @N, sessions by name. Ids stay stable while indices shift as panes/windows move.
+- Numbers the user says (\"pane 2\", \"window 3\") are pane_index/window_index in the CURRENT window/session unless stated otherwise; translate them to ids. Note base-index/pane-base-index in the context.
+- Match the target TYPE each flag expects. The command reference below is authoritative for this tmux version: src-pane/dst-pane/target-pane take a pane; dst-window/src-window/target-window take a WINDOW (never %N, or tmux fails with \"can't specify pane here\"); target-session takes a session. A window target where a pane is expected means that window's active pane.
+- break-pane: -s is the pane; -t is a destination WINDOW index. Omit -t to create a new window.
+
+DIRECTIONS (tmux naming is counter-intuitive)
+- -h = side by side (left/right, vertical divider). -v = stacked (top/bottom, horizontal divider).
+- \"vertical split\" / \"vertically\" is ambiguous (vim users mean side by side, tmux -v means stacked): ask unless context makes it clear.
+- select-layout names: even-horizontal = side by side, even-vertical = stacked, main-horizontal, main-vertical, tiled.
+
+EXAMPLES (ids illustrative: current pane %1 in window @1, index 1, of session work). Answer in exactly this style.
+$(load_examples "$SCRIPT_DIR/examples.txt")
+${USER_EX:+
+USER EXAMPLES (these reflect their personal conventions and win over the ones above):
+$USER_EX
+}
+To undo, invert the previous commands from the history using the CURRENT ids.
+Use the recent history to resolve references like \"undo that\", \"do it again\" or \"the other one\"; the current layout is authoritative.
+Prefer the fewest commands. Do not add select-pane/select-window/display-message unless asked.
+
+COMMAND REFERENCE ($(tmux -V)):
+$(tmux list-commands)"
 
 # ---------- Conversation ----------
 RESP_FILE=$(mktemp "${TMPDIR:-/tmp}/tmux-ai.XXXXXX")
@@ -120,7 +153,8 @@ CONVO="$REQ"   # what gets logged as the request
 call_api() {  # sends MSGS, sets CMDS/CMD_FILE, appends the reply to MSGS. Esc cancels while waiting.
   local payload pid k
   payload=$(jq -n --arg m "$MODEL" --arg s "$SYS" --argjson msgs "$MSGS" \
-    '{model:$m, max_tokens:1024, system:$s, messages:$msgs}')
+    '{model:$m, max_tokens:1024, temperature:0,
+      system:[{type:"text", text:$s, cache_control:{type:"ephemeral"}}], messages:$msgs}')
   printf '\e[2m…thinking\e[0m'
   curl -sS https://api.anthropic.com/v1/messages \
     -H "x-api-key: $ANTHROPIC_API_KEY" \
@@ -161,14 +195,39 @@ log() {  # append an exchange to the log that feeds future prompts
   fi
 }
 
+add_user() { MSGS=$(jq --arg u "$1" '. + [{role:"user", content:$u}]' <<<"$MSGS"); }
+
+run_cmds() {  # run line by line, stop at the first failure (plain source-file keeps going after errors)
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -z ${line//[[:space:]]/} || $line =~ ^[[:space:]]*# ]] && continue
+    if ! OUT=$(printf '%s\n' "$line" | tmux source-file - 2>&1); then
+      FAILED=$line; return 1
+    fi
+  done < "$CMD_FILE"
+}
+
+FIXES=0
 while true; do
   call_api
-  printf '%s\n\n' "$CMDS"
   if ! grep -qv '^#' "$CMD_FILE"; then   # only "# " lines: a question or a refusal
-    ask_reply; continue
+    printf '%s\n\n' "$CMDS"; ask_reply; continue
   fi
-  printf 'Run? [Y/n/e(dit)/r(eply)] '
-  key_or_esc; echo
+  # Pre-flight: have tmux parse the commands without running them; quietly let the model fix syntax errors.
+  if ! VERR=$(tmux source-file -n "$CMD_FILE" 2>&1) && (( FIXES < 2 )); then
+    FIXES=$((FIXES + 1))
+    printf '\e[2m(fixing: %s)\e[0m\n' "$(sed 's/^[^:]*:[0-9]*: //' <<<"$VERR" | head -n 1)"
+    add_user "tmux rejected those commands when parsing them (nothing ran):
+$VERR
+
+Check the command reference and output corrected commands."
+    continue
+  fi
+  FIXES=0
+  printf '%s\n\n' "$CMDS"
+  printf 'Run? [y/n/e(dit)/r(eply)] '
+  while key_or_esc; [[ $REPLY_KEY != [yYnNeErR] ]]; do :; done   # ignore anything else (incl. Enter)
+  echo
   case "$REPLY_KEY" in
     n|N) log "cancelled"; exit 0 ;;
     r|R) ask_reply; continue ;;
@@ -177,18 +236,18 @@ while true; do
   esac
 
   # ---------- Run ----------
-  if OUT=$(tmux source-file "$CMD_FILE" 2>&1); then
+  if run_cmds; then
     log "ran"; exit 0
   fi
-  log "error: $OUT"
-  printf '\e[31mtmux error:\e[0m %s\n\n' "$OUT"
+  log "error in '$FAILED': $OUT"
+  printf '\e[31mtmux error\e[0m in %s:\n%s\n\n' "$FAILED" "$OUT"
   # Hand the error back to the model with the fresh layout, so it can propose a fix.
   CONVO="$CONVO → (tmux error)"
-  MSGS=$(jq --arg u "tmux reported an error running those commands:
-$OUT
+  add_user "This command failed: $FAILED
+tmux said: $OUT
 
-Commands before the failing one may already have run. Current layout:
+Commands before it ran; it and everything after it did NOT run. Current layout:
 $(layout)
 
-Propose corrected commands for what still needs doing." '. + [{role:"user", content:$u}]' <<<"$MSGS")
+Propose corrected commands for what still needs doing."
 done

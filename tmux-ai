@@ -2,7 +2,7 @@
 # tmux-ai — natural-language tmux control.
 #
 # tmux.conf:
-#   bind a display-popup -E -w 70% -h 40% "$HOME/.local/bin/tmux-ai '#{pane_id}'"
+#   bind a display-popup -E -w 70% -h 40% "$HOME/src/tmux-ai/tmux-ai '#{pane_id}'"
 #
 # Needs curl, jq, and an Anthropic API key in $ANTHROPIC_API_KEY or ~/.config/anthropic/api_key.
 # Env knobs: TMUX_AI_MODEL (default Haiku 4.5), TMUX_AI_HISTORY (past exchanges sent as context, default 10).
@@ -27,9 +27,12 @@ if (( BASH_VERSINFO[0] >= 4 )); then POLL=0.1; else POLL=1; fi
 draw_hint() {  # save cursor, paint dim hint on the last row, restore cursor
   printf '\e7\e[%d;%dH\e[2m%s\e[0m\e8' "$ROWS" $(( COLS - ${#HINT} )) "$HINT"
 }
-# Keep the last row out of the scroll region so output never scrolls the hint away.
-printf '\e[1;%dr\e[H' $(( ROWS - 1 ))
-draw_hint
+ui_setup() {  # clear, keep the last row out of the scroll region (so output never scrolls the hint away), draw hint
+  # Note: setting the scroll region also homes the cursor, so only do this on a fresh screen.
+  printf '\e[2J\e[1;%dr\e[H' $(( ROWS - 1 ))
+  draw_hint
+}
+ui_setup
 trap 'printf "\e[r"' EXIT
 
 pause() {  # show a message, wait for any key
@@ -70,7 +73,8 @@ if [[ -s $LOG_FILE && $HIST_N -gt 0 ]]; then
   PAST=$(tail -n "$HIST_N" "$LOG_FILE" | jq -r '"Request: \(.req)\nOutcome: \(.status)\nCommands:\n\(.cmds)\n"' 2>/dev/null)
 fi
 
-CTX=$(cat <<EOF
+layout() {  # the live tmux state, re-read whenever it may have changed
+  cat <<EOF
 Current: $(tmux display -p -t "$PANE" 'session=#{session_name} window=#{window_index} (#{window_name}) pane_index=#{pane_index} pane_id=#{pane_id} window_size=#{window_width}x#{window_height}')
 
 Sessions:
@@ -81,21 +85,27 @@ $(tmux list-windows -a -F '#{session_name}:#{window_index} name=#{window_name} a
 
 Panes:
 $(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} id=#{pane_id} size=#{pane_width}x#{pane_height} at=#{pane_left},#{pane_top} cmd=#{pane_current_command} path=#{pane_current_path} active=#{pane_active}')
+EOF
+}
+
+CTX="$(layout)
 
 Recent history (oldest first; the tmux state may have changed since):
-${PAST:-(none)}
-EOF
-)
+${PAST:-(none)}"
 
 SYS='You translate natural-language requests into tmux commands, in a short conversation with the user.
 When you have enough to act: output ONLY tmux commands in tmux config-file syntax (no leading "tmux", no markdown, no commentary), one per line.
-Always use explicit targets (-t/-s) with pane ids (%N) or session:window.pane from the context, since ids stay stable while indices shift.
+Always use explicit targets (-t/-s) from the context, since ids stay stable while indices shift.
+Match the target TYPE each flag expects, or tmux fails with "cannot specify pane here":
+- pane targets (%N or session:window.pane): join-pane -s/-t, move-pane -s/-t, swap-pane -s/-t, break-pane -s, resize-pane -t, kill-pane -t, select-pane -t, split-window -t
+- window targets (@N or session:window, NEVER a pane): break-pane -t (destination window; to make a new window use "session:" or omit -t), move-window -s/-t, swap-window -s/-t, select-layout -t, rename-window -t, kill-window -t, select-window -t
+- session targets (session name): new-window -t, rename-session -t, switch-client -t
 Pane/window numbers the user mentions mean pane_index/window_index in the CURRENT window/session unless stated otherwise.
 Use the recent history to resolve references like "undo that", "do it again" or "the other one"; the current layout above is authoritative.
 Prefer the fewest commands. Useful: join-pane, break-pane, swap-pane, move-window, select-layout, resize-pane, split-window, rename-window, kill-pane.
 If the request is ambiguous, ask ONE short clarifying question (offer the likely options) on lines starting with "# ", and output no commands. The user will reply.
 If it is impossible, explain briefly on lines starting with "# ".
-Later user messages are replies or corrections; answer each with a complete, fresh set of commands (or another "# " question).'
+Later user messages are replies, corrections, or tmux errors from running your commands (with the updated layout); answer each with a complete, fresh set of commands for what still needs doing (or another "# " question).'
 
 # ---------- Conversation ----------
 RESP_FILE=$(mktemp "${TMPDIR:-/tmp}/tmux-ai.XXXXXX")
@@ -162,18 +172,23 @@ while true; do
   case "$REPLY_KEY" in
     n|N) log "cancelled"; exit 0 ;;
     r|R) ask_reply; continue ;;
-    e|E) printf '\e[r'; "${EDITOR:-vi}" "$CMD_FILE" ;;
+    e|E) "${EDITOR:-vi}" "$CMD_FILE"
+         ui_setup; printf 'Running edited commands:\n%s\n\n' "$(cat "$CMD_FILE")" ;;
   esac
-  break
-done
 
-# ---------- Run ----------
-if OUT=$(tmux source-file "$CMD_FILE" 2>&1); then
-  log "ran"
-else
+  # ---------- Run ----------
+  if OUT=$(tmux source-file "$CMD_FILE" 2>&1); then
+    log "ran"; exit 0
+  fi
   log "error: $OUT"
-  printf '\e[1;%dr' $(( ROWS - 1 )); draw_hint
-  pause "tmux error:
+  printf '\e[31mtmux error:\e[0m %s\n\n' "$OUT"
+  # Hand the error back to the model with the fresh layout, so it can propose a fix.
+  CONVO="$CONVO → (tmux error)"
+  MSGS=$(jq --arg u "tmux reported an error running those commands:
 $OUT
-(press any key)" 1
-fi
+
+Commands before the failing one may already have run. Current layout:
+$(layout)
+
+Propose corrected commands for what still needs doing." '. + [{role:"user", content:$u}]' <<<"$MSGS")
+done

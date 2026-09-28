@@ -87,66 +87,87 @@ ${PAST:-(none)}
 EOF
 )
 
-SYS='You translate natural-language requests into tmux commands.
-Output ONLY tmux commands in tmux config-file syntax (no leading "tmux", no markdown, no commentary), one per line.
+SYS='You translate natural-language requests into tmux commands, in a short conversation with the user.
+When you have enough to act: output ONLY tmux commands in tmux config-file syntax (no leading "tmux", no markdown, no commentary), one per line.
 Always use explicit targets (-t/-s) with pane ids (%N) or session:window.pane from the context, since ids stay stable while indices shift.
 Pane/window numbers the user mentions mean pane_index/window_index in the CURRENT window/session unless stated otherwise.
 Use the recent history to resolve references like "undo that", "do it again" or "the other one"; the current layout above is authoritative.
 Prefer the fewest commands. Useful: join-pane, break-pane, swap-pane, move-window, select-layout, resize-pane, split-window, rename-window, kill-pane.
-If the request is impossible or dangerously ambiguous, output a single line starting with "# " explaining why.'
+If the request is ambiguous, ask ONE short clarifying question (offer the likely options) on lines starting with "# ", and output no commands. The user will reply.
+If it is impossible, explain briefly on lines starting with "# ".
+Later user messages are replies or corrections; answer each with a complete, fresh set of commands (or another "# " question).'
 
-PAYLOAD=$(jq -n --arg m "$MODEL" --arg s "$SYS" --arg u "$CTX
-
-Request: $REQ" \
-  '{model:$m, max_tokens:1024, system:$s, messages:[{role:"user", content:$u}]}')
-
-# ---------- Call the API (Esc cancels while waiting) ----------
+# ---------- Conversation ----------
 RESP_FILE=$(mktemp "${TMPDIR:-/tmp}/tmux-ai.XXXXXX")
 CMD_FILE=$(mktemp "${TMPDIR:-/tmp}/tmux-ai.XXXXXX")
 trap 'rm -f "$RESP_FILE" "$CMD_FILE"; printf "\e[r"' EXIT
 
-printf '\e[2m…thinking\e[0m'
-curl -sS https://api.anthropic.com/v1/messages \
-  -H "x-api-key: $ANTHROPIC_API_KEY" \
-  -H "anthropic-version: 2023-06-01" \
-  -H "content-type: application/json" \
-  -d "$PAYLOAD" -o "$RESP_FILE" 2>/dev/null &
-CURL_PID=$!
-while kill -0 "$CURL_PID" 2>/dev/null; do
-  if read -rsn1 -t "$POLL" k && [[ $k == "$ESC" ]]; then
-    kill "$CURL_PID" 2>/dev/null; exit 0
-  fi
-done
-wait "$CURL_PID" || { printf '\r\e[K'; pause "Network error — couldn't reach the API. (press any key)" 1; }
-printf '\r\e[K'
+MSGS=$(jq -n --arg u "$CTX
 
-CMDS=$(jq -r '.content[0].text // ("# API error: " + (.error.message // "unknown"))' "$RESP_FILE" 2>/dev/null \
-       | sed '/^```/d')
-[[ -n $CMDS ]] || CMDS="# Unreadable API response"
-printf '%s\n' "$CMDS" > "$CMD_FILE"
+Request: $REQ" '[{role:"user", content:$u}]')
+CONVO="$REQ"   # what gets logged as the request
+
+call_api() {  # sends MSGS, sets CMDS/CMD_FILE, appends the reply to MSGS. Esc cancels while waiting.
+  local payload pid k
+  payload=$(jq -n --arg m "$MODEL" --arg s "$SYS" --argjson msgs "$MSGS" \
+    '{model:$m, max_tokens:1024, system:$s, messages:$msgs}')
+  printf '\e[2m…thinking\e[0m'
+  curl -sS https://api.anthropic.com/v1/messages \
+    -H "x-api-key: $ANTHROPIC_API_KEY" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d "$payload" -o "$RESP_FILE" 2>/dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if read -rsn1 -t "$POLL" k && [[ $k == "$ESC" ]]; then kill "$pid" 2>/dev/null; exit 0; fi
+  done
+  wait "$pid" || { printf '\r\e[K'; pause "Network error — couldn't reach the API. (press any key)" 1; }
+  printf '\r\e[K'
+
+  local err; err=$(jq -r '.error.message // empty' "$RESP_FILE" 2>/dev/null)
+  [[ -n $err ]] && pause "API error: $err
+(press any key)" 1
+  CMDS=$(jq -r '.content[0].text // empty' "$RESP_FILE" 2>/dev/null | sed '/^```/d')
+  [[ -n $CMDS ]] || pause "Unreadable API response. (press any key)" 1
+  printf '%s\n' "$CMDS" > "$CMD_FILE"
+  MSGS=$(jq --arg a "$CMDS" '. + [{role:"assistant", content:$a}]' <<<"$MSGS")
+}
+
+ask_reply() {  # follow-up from the user; empty line or Esc closes
+  local r
+  read -e -r -p "reply> " r || exit 0
+  [[ -z ${r// } ]] && exit 0
+  history -s "$r"
+  CONVO="$CONVO → $r"
+  MSGS=$(jq --arg u "$r" '. + [{role:"user", content:$u}]' <<<"$MSGS")
+  echo
+}
 
 log() {  # append an exchange to the log that feeds future prompts
-  jq -nc --arg req "$REQ" --arg cmds "$(cat "$CMD_FILE")" --arg status "$1" \
+  jq -nc --arg req "$CONVO" --arg cmds "$(cat "$CMD_FILE")" --arg status "$1" \
     '{ts: (now|floor), req:$req, cmds:$cmds, status:$status}' >> "$LOG_FILE"
   if (( $(wc -l < "$LOG_FILE") > 1000 )); then
     tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
   fi
 }
 
-printf '%s\n\n' "$CMDS"
-if ! grep -qv '^#' "$CMD_FILE"; then
-  log "refused"
-  pause "(press any key)"
-fi
+while true; do
+  call_api
+  printf '%s\n\n' "$CMDS"
+  if ! grep -qv '^#' "$CMD_FILE"; then   # only "# " lines: a question or a refusal
+    ask_reply; continue
+  fi
+  printf 'Run? [Y/n/e(dit)/r(eply)] '
+  key_or_esc; echo
+  case "$REPLY_KEY" in
+    n|N) log "cancelled"; exit 0 ;;
+    r|R) ask_reply; continue ;;
+    e|E) printf '\e[r'; "${EDITOR:-vi}" "$CMD_FILE" ;;
+  esac
+  break
+done
 
-# ---------- Confirm and run ----------
-printf 'Run? [Y/n/e(dit)] '
-key_or_esc; echo
-case "$REPLY_KEY" in
-  n|N) log "cancelled"; exit 0 ;;
-  e|E) printf '\e[r'; "${EDITOR:-vi}" "$CMD_FILE" ;;
-esac
-
+# ---------- Run ----------
 if OUT=$(tmux source-file "$CMD_FILE" 2>&1); then
   log "ran"
 else

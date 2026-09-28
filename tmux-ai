@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# tmux-ai — natural-language tmux control.
+# Usage (from tmux.conf):  bind a display-popup -E -w 70% -h 40% "tmux-ai '#{pane_id}'"
+# Requires: curl, jq, ANTHROPIC_API_KEY in the tmux server's environment.
+set -euo pipefail
+
+PANE="${1:-$(tmux display -p '#{pane_id}')}"
+MODEL="${TMUX_AI_MODEL:-claude-haiku-4-5-20251001}"
+: "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY not set (set-environment -g or export before starting tmux)}"
+
+read -e -r -p "tmux> " REQ
+[[ -z "$REQ" ]] && exit 0
+
+CTX=$(cat <<EOF
+Current: $(tmux display -p -t "$PANE" 'session=#{session_name} window=#{window_index} (#{window_name}) pane_index=#{pane_index} pane_id=#{pane_id} window_size=#{window_width}x#{window_height}')
+
+Sessions:
+$(tmux list-sessions -F '#{session_name} windows=#{session_windows} attached=#{session_attached}')
+
+Windows:
+$(tmux list-windows -a -F '#{session_name}:#{window_index} name=#{window_name} active=#{window_active} layout=#{window_layout}')
+
+Panes:
+$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} id=#{pane_id} size=#{pane_width}x#{pane_height} at=#{pane_left},#{pane_top} cmd=#{pane_current_command} path=#{pane_current_path} active=#{pane_active}')
+EOF
+)
+
+SYS='You translate natural-language requests into tmux commands.
+Output ONLY tmux commands in tmux config-file syntax (no leading "tmux", no markdown, no commentary), one per line.
+Always use explicit targets (-t/-s) with pane ids (%N) or session:window.pane from the context, since ids stay stable while indices shift.
+Pane/window numbers the user mentions mean pane_index/window_index in the CURRENT window/session unless stated otherwise.
+Prefer the fewest commands. Useful: join-pane, break-pane, swap-pane, move-window, select-layout, resize-pane, split-window, rename-window, kill-pane.
+If the request is impossible or dangerously ambiguous, output a single line starting with "# " explaining why.'
+
+PAYLOAD=$(jq -n --arg m "$MODEL" --arg s "$SYS" --arg u "$CTX
+
+Request: $REQ" \
+  '{model:$m, max_tokens:1024, system:$s, messages:[{role:"user", content:$u}]}')
+
+echo "…thinking"
+RESP=$(curl -sS https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d "$PAYLOAD")
+
+CMDS=$(jq -r '.content[0].text // ("# API error: " + (.error.message // "unknown"))' <<<"$RESP" | sed '/^```/d')
+
+TMP=$(mktemp -t tmux-ai.XXXXXX)
+trap 'rm -f "$TMP"' EXIT
+printf '%s\n' "$CMDS" > "$TMP"
+
+printf '\n%s\n\n' "$CMDS"
+if ! grep -qv '^#' "$TMP"; then read -r -n1 -p "(press any key)"; exit 0; fi
+
+read -r -n1 -p "Run? [Y/n/e(dit)] " ans; echo
+case "$ans" in
+  n|N) exit 0 ;;
+  e|E) "${EDITOR:-vi}" "$TMP" ;;
+esac
+
+if ! OUT=$(tmux source-file "$TMP" 2>&1); then
+  printf 'tmux error:\n%s\n' "$OUT"; read -r -n1 -p "(press any key)"
+fi

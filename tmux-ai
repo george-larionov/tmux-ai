@@ -1,15 +1,74 @@
 #!/usr/bin/env bash
 # tmux-ai — natural-language tmux control.
-# Usage (from tmux.conf):  bind a display-popup -E -w 70% -h 40% "tmux-ai '#{pane_id}'"
-# Requires: curl, jq, ANTHROPIC_API_KEY in the tmux server's environment.
-set -euo pipefail
+#
+# tmux.conf:
+#   bind a display-popup -E -w 70% -h 40% "$HOME/.local/bin/tmux-ai '#{pane_id}'"
+#
+# Needs curl, jq, and an Anthropic API key in $ANTHROPIC_API_KEY or ~/.config/anthropic/api_key.
+# Env knobs: TMUX_AI_MODEL (default Haiku 4.5), TMUX_AI_HISTORY (past exchanges sent as context, default 10).
+set -uo pipefail
 
 PANE="${1:-$(tmux display -p '#{pane_id}')}"
 MODEL="${TMUX_AI_MODEL:-claude-haiku-4-5-20251001}"
-: "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY not set (set-environment -g or export before starting tmux)}"
+HIST_N="${TMUX_AI_HISTORY:-10}"
 
-read -e -r -p "tmux> " REQ
-[[ -z "$REQ" ]] && exit 0
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-ai"
+HIST_FILE="$STATE/history"    # one request per line, for ↑ recall
+LOG_FILE="$STATE/log.jsonl"   # request + commands + outcome, fed back to the model
+mkdir -p "$STATE"
+
+# ---------- UI ----------
+ROWS=$(tput lines); COLS=$(tput cols)
+HINT="Press Esc to close"
+ESC=$'\e'
+# Fractional read timeouts need bash 4+ (macOS ships 3.2 — `brew install bash` recommended).
+if (( BASH_VERSINFO[0] >= 4 )); then POLL=0.1; else POLL=1; fi
+
+draw_hint() {  # save cursor, paint dim hint on the last row, restore cursor
+  printf '\e7\e[%d;%dH\e[2m%s\e[0m\e8' "$ROWS" $(( COLS - ${#HINT} )) "$HINT"
+}
+# Keep the last row out of the scroll region so output never scrolls the hint away.
+printf '\e[1;%dr\e[H' $(( ROWS - 1 ))
+draw_hint
+trap 'printf "\e[r"' EXIT
+
+pause() {  # show a message, wait for any key
+  printf '%s\n' "$1"; read -rsn1 _
+  exit "${2:-0}"
+}
+
+key_or_esc() {  # read one key; Esc closes the popup
+  local k; read -rsn1 k
+  [[ $k == "$ESC" ]] && exit 0
+  REPLY_KEY=$k
+}
+
+# ---------- API key ----------
+ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$(cat ~/.config/anthropic/api_key 2>/dev/null)}"
+[[ -n $ANTHROPIC_API_KEY ]] || pause "No API key: set ANTHROPIC_API_KEY or create ~/.config/anthropic/api_key" 1
+command -v jq >/dev/null || pause "jq not found — install it (brew/apt install jq)" 1
+
+# ---------- Prompt (readline, with history and Esc) ----------
+bind 'set keyseq-timeout 50' 2>/dev/null
+bind -x '"\e": exit 0' 2>/dev/null   # bare Esc quits; arrow keys still work
+HISTFILE="$HIST_FILE"
+history -r "$HIST_FILE" 2>/dev/null
+
+read -e -r -p "tmux> " REQ || exit 0
+[[ -z ${REQ// } ]] && exit 0
+if [[ $REQ != "$(tail -n 1 "$HIST_FILE" 2>/dev/null)" ]]; then  # skip consecutive dupes
+  printf '%s\n' "$REQ" >> "$HIST_FILE"
+fi
+# Keep the history file bounded.
+if (( $(wc -l < "$HIST_FILE") > 1000 )); then
+  tail -n 500 "$HIST_FILE" > "$HIST_FILE.tmp" && mv "$HIST_FILE.tmp" "$HIST_FILE"
+fi
+
+# ---------- Context ----------
+PAST=""
+if [[ -s $LOG_FILE && $HIST_N -gt 0 ]]; then
+  PAST=$(tail -n "$HIST_N" "$LOG_FILE" | jq -r '"Request: \(.req)\nOutcome: \(.status)\nCommands:\n\(.cmds)\n"' 2>/dev/null)
+fi
 
 CTX=$(cat <<EOF
 Current: $(tmux display -p -t "$PANE" 'session=#{session_name} window=#{window_index} (#{window_name}) pane_index=#{pane_index} pane_id=#{pane_id} window_size=#{window_width}x#{window_height}')
@@ -22,6 +81,9 @@ $(tmux list-windows -a -F '#{session_name}:#{window_index} name=#{window_name} a
 
 Panes:
 $(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} id=#{pane_id} size=#{pane_width}x#{pane_height} at=#{pane_left},#{pane_top} cmd=#{pane_current_command} path=#{pane_current_path} active=#{pane_active}')
+
+Recent history (oldest first; the tmux state may have changed since):
+${PAST:-(none)}
 EOF
 )
 
@@ -29,6 +91,7 @@ SYS='You translate natural-language requests into tmux commands.
 Output ONLY tmux commands in tmux config-file syntax (no leading "tmux", no markdown, no commentary), one per line.
 Always use explicit targets (-t/-s) with pane ids (%N) or session:window.pane from the context, since ids stay stable while indices shift.
 Pane/window numbers the user mentions mean pane_index/window_index in the CURRENT window/session unless stated otherwise.
+Use the recent history to resolve references like "undo that", "do it again" or "the other one"; the current layout above is authoritative.
 Prefer the fewest commands. Useful: join-pane, break-pane, swap-pane, move-window, select-layout, resize-pane, split-window, rename-window, kill-pane.
 If the request is impossible or dangerously ambiguous, output a single line starting with "# " explaining why.'
 
@@ -37,28 +100,59 @@ PAYLOAD=$(jq -n --arg m "$MODEL" --arg s "$SYS" --arg u "$CTX
 Request: $REQ" \
   '{model:$m, max_tokens:1024, system:$s, messages:[{role:"user", content:$u}]}')
 
-echo "…thinking"
-RESP=$(curl -sS https://api.anthropic.com/v1/messages \
+# ---------- Call the API (Esc cancels while waiting) ----------
+RESP_FILE=$(mktemp "${TMPDIR:-/tmp}/tmux-ai.XXXXXX")
+CMD_FILE=$(mktemp "${TMPDIR:-/tmp}/tmux-ai.XXXXXX")
+trap 'rm -f "$RESP_FILE" "$CMD_FILE"; printf "\e[r"' EXIT
+
+printf '\e[2m…thinking\e[0m'
+curl -sS https://api.anthropic.com/v1/messages \
   -H "x-api-key: $ANTHROPIC_API_KEY" \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
-  -d "$PAYLOAD")
+  -d "$PAYLOAD" -o "$RESP_FILE" 2>/dev/null &
+CURL_PID=$!
+while kill -0 "$CURL_PID" 2>/dev/null; do
+  if read -rsn1 -t "$POLL" k && [[ $k == "$ESC" ]]; then
+    kill "$CURL_PID" 2>/dev/null; exit 0
+  fi
+done
+wait "$CURL_PID" || { printf '\r\e[K'; pause "Network error — couldn't reach the API. (press any key)" 1; }
+printf '\r\e[K'
 
-CMDS=$(jq -r '.content[0].text // ("# API error: " + (.error.message // "unknown"))' <<<"$RESP" | sed '/^```/d')
+CMDS=$(jq -r '.content[0].text // ("# API error: " + (.error.message // "unknown"))' "$RESP_FILE" 2>/dev/null \
+       | sed '/^```/d')
+[[ -n $CMDS ]] || CMDS="# Unreadable API response"
+printf '%s\n' "$CMDS" > "$CMD_FILE"
 
-TMP=$(mktemp -t tmux-ai.XXXXXX)
-trap 'rm -f "$TMP"' EXIT
-printf '%s\n' "$CMDS" > "$TMP"
+log() {  # append an exchange to the log that feeds future prompts
+  jq -nc --arg req "$REQ" --arg cmds "$(cat "$CMD_FILE")" --arg status "$1" \
+    '{ts: (now|floor), req:$req, cmds:$cmds, status:$status}' >> "$LOG_FILE"
+  if (( $(wc -l < "$LOG_FILE") > 1000 )); then
+    tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+  fi
+}
 
-printf '\n%s\n\n' "$CMDS"
-if ! grep -qv '^#' "$TMP"; then read -r -n1 -p "(press any key)"; exit 0; fi
+printf '%s\n\n' "$CMDS"
+if ! grep -qv '^#' "$CMD_FILE"; then
+  log "refused"
+  pause "(press any key)"
+fi
 
-read -r -n1 -p "Run? [Y/n/e(dit)] " ans; echo
-case "$ans" in
-  n|N) exit 0 ;;
-  e|E) "${EDITOR:-vi}" "$TMP" ;;
+# ---------- Confirm and run ----------
+printf 'Run? [Y/n/e(dit)] '
+key_or_esc; echo
+case "$REPLY_KEY" in
+  n|N) log "cancelled"; exit 0 ;;
+  e|E) printf '\e[r'; "${EDITOR:-vi}" "$CMD_FILE" ;;
 esac
 
-if ! OUT=$(tmux source-file "$TMP" 2>&1); then
-  printf 'tmux error:\n%s\n' "$OUT"; read -r -n1 -p "(press any key)"
+if OUT=$(tmux source-file "$CMD_FILE" 2>&1); then
+  log "ran"
+else
+  log "error: $OUT"
+  printf '\e[1;%dr' $(( ROWS - 1 )); draw_hint
+  pause "tmux error:
+$OUT
+(press any key)" 1
 fi
